@@ -46,6 +46,8 @@ SUBDIRS= 					\
 	uzlib					\
 	$(OPT_SEL_MKTARGETS)
 
+#	bearssl 				\
+
 endif # } PDIR
 
 APPDIR = .

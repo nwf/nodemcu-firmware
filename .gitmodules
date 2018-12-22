@@ -4,3 +4,6 @@
 [submodule "app/ucglib/ucg"]
         path = app/ucglib/ucg
         url = https://github.com/olikraus/Ucglib_Arduino.git
+[submodule "app/bearssl"]
+	path = app/bearssl
+	url = https://www.bearssl.org/git/BearSSL
