@@ -28,18 +28,38 @@ If any sync operation fails (maybe the device is disconnected from the internet)
 #### Parameters
 - `server_ip` if non-`nil`, that server is used. If `nil`, then the last contacted server is used. If there is no previous server, then the pool ntp servers are used. If the anycast server was used, then the first responding server will be saved.
 - `server1`, `server2` these are either the ip address or dns name of one or more servers to try.
-- `callback` if provided it will be invoked on a successful synchronization, with four parameters: seconds, microseconds, server and info. Note that when the [rtctime](rtctime.md) module is available, there is no need to explicitly call [`rtctime.set()`](rtctime.md#rtctimeset) - this module takes care of doing so internally automatically, for best accuracy. The info parameter is a table of (semi) interesting values. These are described below.
-- `errcallback` failure callback with two parameters. The first is an integer describing the type of error. The module automatically performs a number of retries before giving up and reporting the error. The second is a string containing supplementary information (if any). Error codes:
-  - 1: DNS lookup failed (the second parameter is the failing DNS name)
-  - 2: Memory allocation failure
-  - 3: UDP send failed
-  - 4: Timeout, no NTP response received
+- `callback`, if provided, will be invoked on a successful synchronization, as described below.
+- `errcallback`, if provided, will be invoked on failures within the module, as described below, after exhausting automatic retries before giving up and reporting the error.
 - `autorepeat` if this is non-nil, then the synchronization will happen every 1000 seconds and try and condition the clock if possible. The callbacks will be called after each sync operation.
 
 #### Returns
 `nil`
 
-#### Info table
+#### Callback Details
+
+Failure callbacks may be dispatched *per-server* and *per-synchronization*
+while success callbacks are just *per-synchronization*.  The
+per-synchronization failure callback, if invoked, will give `nil` as the server
+parameter.  The single server reported to the success callback is, potentially,
+the best of many; no status information will be reported for successful
+communication with other successfully-contacted servers.
+
+The success callback is invoked with four parameters: seconds, microseconds,
+server and info. Note that when the [rtctime](rtctime.md) module is available,
+there is no need to explicitly call [`rtctime.set()`](rtctime.md#rtctimeset) -
+this module takes care of doing so internally automatically, for best accuracy.
+The info parameter is a table of (semi) interesting values. These are described
+below.
+
+The failure callback is invoked with two parameters.  The first is an integer
+describing the type of error.  The second is the server name as originally
+provided to `sntp.sync`, or `nil` to indicate the failure is total.  The error
+codes defined are:
+  - 1: DNS lookup failed
+  - 3: UDP send failed
+  - 4: Timeout, no NTP response received
+
+##### Info table
 This is passed to the success callback and contains useful information about the time synch that just completed. The keys in this table are:
 
 - `offset_s` This is an optional field and contains the number of seconds that the clock was adjusted. This is only present for large (many second) adjustments. Typically, this is only present on the initial sync call.
