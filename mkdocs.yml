@@ -61,6 +61,7 @@ pages:
     - 'liquidcrystal': 'lua-modules/liquidcrystal.md'
     - 'lm92': 'lua-modules/lm92.md'
     - 'mcp23008': 'lua-modules/mcp23008.md'
+    - 'sntp': 'lua-modules/sntp.md'
     - 'redis': 'lua-modules/redis.md'
     - 'telnet': 'lua-modules/telnet.md'
     - 'yeelink': 'lua-modules/yeelink.md'
@@ -113,6 +114,7 @@ pages:
     - 'sigma delta': 'modules/sigma-delta.md'
     - 'sjson': 'modules/sjson.md'
     - 'sntp': 'modules/sntp.md'
+    # sntppkt deliberately not documented
     - 'softuart': 'modules/softuart.md'
     - 'somfy': 'modules/somfy.md'
     - 'spi': 'modules/spi.md'
