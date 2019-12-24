@@ -1,0 +1,9 @@
+set foldmethod=marker
+
+set foldtext=MyFoldText()
+function MyFoldText()
+  if match(getline(v:foldstart), '^[# ]*# {{{') >= 0
+    let v:foldstart = nextnonblank(v:foldstart+1)
+  end
+  return foldtext()
+endfunction
