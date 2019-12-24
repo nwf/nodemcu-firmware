@@ -1,0 +1,580 @@
+#!/usr/bin/env expect
+
+# Walk a NodeMCU device through some basic TLS functionality tests.
+#
+# Requires `socat` and `openssl` on the host side; tested only on Linux.
+#
+# A typical invocation looks like:
+#   export TCLLIBPATH=./expectnmcu NODEMCU_TESTTMP=/tmp/nodemcu
+#   ./preflight-tls.sh
+#   ./test-tls.expect -serial /dev/ttyUSB3 -wifi "$(cat wificmd)"
+#
+# where the file `wificmd` contains something like
+#  wifi.setmode(wifi.STATION); wifi.sta.config({...}); wifi.sta.connect()
+# where the ... is filled in with the local network's configuration.  All on
+# one line, tho', so that the script just gets one prompt back.
+#
+# For debugging the test itself, it may be useful to invoke expect with -d,
+# which will give a great deal of diagnostic information about the expect state
+# machine's internals:
+#   TCLLIBPATH=./expectnmcu expect -d ./tls-test.expect ...
+
+package require struct::stack
+package require expectnmcu::core
+  namespace import expectnmcu::core::send_exp_prompt
+  namespace import expectnmcu::core::send_exp_prompt_c
+  namespace import expectnmcu::core::send_exp_res_prompt
+package require expectnmcu::net
+package require tcltest
+
+::struct::stack ulogstack
+proc pushulog { new } {
+  ulogstack push [log_user -info]
+  log_user ${new}
+}
+proc populog { } { log_user [ulogstack pop] }
+
+# {{{
+# preptls: define tlsbasic()
+proc preptls { victim } {
+  send_exp_prompt_c ${victim} "function tlsbasic(id,port,host)"
+  send_exp_prompt_c ${victim} "  local c = tls.createConnection()"
+  send_exp_prompt_c ${victim} "  c:on(\"receive\", function(sck, d) print(\"RECV\",id,d) end)"
+  send_exp_prompt_c ${victim} "  c:on(\"connection\", function(sck) print(\"CONN\",id); sck:send(\"GET / HTTP/1.0\\r\\n\\r\\n\") end)"
+  send_exp_prompt_c ${victim} "  c:on(\"disconnection\", function(sck) print(\"DISC\",id) end)"
+  send_exp_prompt_c ${victim} "  c:connect(port,host)"
+  send_exp_prompt_c ${victim} "  return c"
+  send_exp_prompt   ${victim} "end"
+}
+# }}}
+
+# {{{
+# Basic connectivity test, including disconnection of localsid.
+proc basicconntest { id localsid victimsid victimconn } {
+  # Initial connection might take a long while
+  expect {
+    -timeout 60
+    -i ${victimsid} "CONN\t${id}" { }
+    timeout { return "timeout while waiting for CONN" }
+  }
+  pushulog 0
+  expect {
+    -timeout 2
+    -i ${localsid} "GET / HTTP/1.0\r\n\r\n" {
+      send -i ${localsid} "abracadabra"
+    }
+    -i ${localsid} -re "(.+)$" {
+      # If socat says anything else, it's almost surely an error
+      return "socat spoke: ${expect_out(1,string)}"
+    }
+    timeout { return "timeout while waiting for GET" }
+  }
+  populog
+  expect {
+    -timeout 2
+    -i ${victimsid} "RECV\t${id}\tabracadabra" {
+      send_exp_prompt ${victimsid} "${victimconn}:send(\"test 1 2 3 4\")"
+    }
+    timeout { return "timeout while waiting for RECV" }
+  }
+  pushulog 0
+  expect {
+    -timeout 2
+    -i ${localsid} "test 1 2 3 4" {
+      close -i ${localsid}
+    }
+    timeout { return "timeout while waiting for response" }
+  }
+  populog
+  expect {
+    -timeout 15
+    -i ${victimsid} "DISC\t${id}" { }
+    timeout { return "timeout while waiting for DISC" }
+  }
+
+  send_exp_prompt ${victimsid} "=node.heap()"
+
+  return "ok"
+}
+# }}}
+
+# {{{
+# Bail if our preflight TLS keys don't exist
+if { [info exists ::env(NODEMCU_TESTTMP)] } {
+  set tdir $::env(NODEMCU_TESTTMP)
+} else {
+  send_user "==> Specify NODEMCU_TESTTMP in environment <=="
+  exit 1
+}
+
+set fntls256v1 "${tdir}/tmp-ec256v1"
+if { ! [file exists "${fntls256v1}.key" ] } {
+  send_user "Please run preflight script; EC TLS keys not found";
+}
+set fntls384r1 "${tdir}/tmp-ec384r1"
+if { ! [file exists "${fntls384r1}.key" ] } {
+  send_user "Please run preflight script; EC TLS keys not found";
+}
+set fntlsrsa2 "${tdir}/tmp-rsa2048"
+if { ! [file exists "${fntlsrsa2}.key" ] } {
+  send_user "Please run preflight script; RSA TLS key not found";
+}
+# }}}
+
+# {{{
+# Command-line parsing
+package require cmdline
+set cmd_parameters {
+  { serial.arg "/dev/ttyUSB0"   "Set the serial interface name" }
+  { wifi.arg   ""               "Command to run to bring up the network" }
+  { ip.arg     ""               "My IP address (will guess if not given)" }
+  { tcfg.arg   ""               "Specify key/value pairs for tcltest config" }
+  { noboot                      "Do not reboot the DUT" }
+  { debug                       "Turn on debugging" }
+}
+set cmd_usage "- A NodeMCU TLS test program"
+if {[catch {array set cmdopts [cmdline::getoptions ::argv $cmd_parameters $cmd_usage]}]} {
+  send_user [cmdline::usage $cmd_parameters $cmd_usage]
+  exit 0
+}
+# }}}
+
+::tcltest::configure -verbose pste
+foreach {k v} [split ${cmdopts(tcfg)}] { ::tcltest::configure ${k} ${v} }
+
+set victim [::expectnmcu::core::connect ${cmdopts(serial)} \
+              -reboot [expr ${cmdopts(noboot)} ? 0 : 1] ]
+send_user "\n===> Machine has booted <===\n"
+
+# Program a routine for TLS connections
+preptls ${victim}
+
+if { ${cmdopts(debug)} } {
+  send_exp_prompt ${victim} "tls.setDebug(2)"
+} else {
+  send_exp_prompt ${victim} "tls.setDebug(0)"
+}
+
+# Bring up the network
+if {0 < [string length ${cmdopts(wifi)}]} {
+  send_exp_prompt ${victim} ${cmdopts(wifi)}
+}
+set victimip [::expectnmcu::net::waitwifista ${victim}]
+send_user "\n===> Victim IP address ${victimip} <===\n"
+
+if {0 < [string length ${cmdopts(ip)}]} {
+  set myip ${cmdopts(ip)}
+} else {
+  set myip [::expectnmcu::net::guessmyip ${victimip}]
+}
+
+###############################################################################
+### And now for the tests
+###############################################################################
+
+send_exp_prompt ${victim} "=node.heap()"
+
+###############################################################################
+### Basic API flow
+###############################################################################
+
+# {{{
+::tcltest::test tls_basic_create_close_disconn {
+  Check that calling :close() fires the disconnect callback.
+} -body {
+  spawn -noecho "socat" "STDIO,cfmakeraw" "OPENSSL-LISTEN:12345,verify=0,certificate=${fntls256v1}.crt,key=${fntls256v1}.key,reuseaddr"
+
+  send_exp_prompt ${victim} "c = tls.createConnection()"
+  send_exp_prompt ${victim} "c:on(\"connection\", function(skt) print (\"CONN\", skt) skt:close() end)"
+  send_exp_prompt ${victim} "c:on(\"disconnection\", function(skt) print(\"DISC\", skt) end)"
+  send_exp_prompt ${victim} "c:connect(12345, \"${myip}\")"
+  send_exp_prompt ${victim} "c = nil"
+
+  set timeout 10
+  expect {
+    -i ${victim} "DISC" { }
+    timeout {
+      close ${spawn_id}
+      return "timeout"
+    }
+  }
+
+  send_exp_prompt ${victim} ""
+  return "ok"
+} -cleanup {
+  close ${spawn_id}
+} -result "ok"
+# }}}
+
+###############################################################################
+### noverify connectivity tests
+###############################################################################
+
+# {{{
+::tcltest::test tls_256v1_noverify {
+  SSL 256v1, no verify
+} -body {
+  spawn -noecho "socat" "STDIO,cfmakeraw" "OPENSSL-LISTEN:12345,verify=0,certificate=${fntls256v1}.crt,key=${fntls256v1}.key,reuseaddr"
+
+  # Disengage deprecated API
+  send_exp_prompt ${victim} "tls.cert.auth(false)"
+  send_exp_prompt ${victim} "tls.cert.verify(false)"
+
+  send_exp_prompt ${victim} "c = tlsbasic(0,12345,\"${myip}\")"
+  basicconntest 0 ${spawn_id} ${victim} "c"
+} -result "ok"
+# }}}
+
+# {{{
+::tcltest::test tls_384r1_noverify {
+  SSL 384r1, no verify
+} -body {
+  spawn -noecho "socat" "STDIO,cfmakeraw" "OPENSSL-LISTEN:12345,verify=0,certificate=${fntls384r1}.crt,key=${fntls384r1}.key,reuseaddr"
+
+  # Disengage deprecated API
+  send_exp_prompt ${victim} "tls.cert.auth(false)"
+  send_exp_prompt ${victim} "tls.cert.verify(false)"
+
+  send_exp_prompt ${victim} "c = tlsbasic(1,12345,\"${myip}\")"
+  basicconntest 1 ${spawn_id} ${victim} "c"
+} -cleanup {
+  send_exp_prompt ${victim} "c:close(); c = nil"
+  close ${spawn_id}
+} -result "ok"
+# }}}
+
+# {{{
+#### ::tcltest::test tls_256v1_noverify_hold {
+####   SSL 256v1, no verify, hold and unhold the connection
+#### } -body {
+####   spawn -noecho "socat" "STDIO,cfmakeraw" "OPENSSL-LISTEN:12345,verify=0,certificate=${fntls256v1}.crt,key=${fntls256v1}.key,reuseaddr"
+#### 
+####   # Disengage deprecated API
+####   send_exp_prompt ${victim} "tls.cert.auth(false)"
+####   send_exp_prompt ${victim} "tls.cert.verify(false)"
+#### 
+####   send_exp_prompt ${victim} "c = tlsbasic(8,12345,\"${myip}\")"
+#### 
+####   expect {
+####     -timeout 15
+####     -i ${victim} "CONN\t8" { }
+####     timeout { return "timeout while waiting for CONN" }
+####   }
+#### 
+####   expect {
+####     -timeout 2
+####     -i ${spawn_id} "GET / HTTP/1.0\r\n\r\n" {
+####       send_exp_prompt ${victim} "c:hold()"
+####       send -i ${spawn_id} "abracadabra"
+####     }
+####     -i ${spawn_id} -re "(.+)$" {
+####       # If socat says anything else, it's almost surely an error
+####       return "socat spoke: ${expect_out(1,string)}"
+####     }
+####     timeout { return "timeout while waiting for GET" }
+####   }
+#### 
+####   expect {
+####     -timeout 2
+####     -i ${victim} "RECV\t8\tabracadabra" {
+####       return "Client rx'd despite hold"
+####     }
+####     timeout { }
+####   }
+#### 
+####   send_exp_prompt ${victim} "c:unhold()"
+#### 
+####   expect {
+####     -timeout 2
+####     -i ${victim} "RECV\t8\tabracadabra" { }
+####     timeout { return "Client timed out after unhold" }
+####   }
+#### 
+####   send_exp_prompt ${victim} "c:close()"
+#### 
+####   expect {
+####     -timeout 15
+####     -i ${victim} "DISC\t8" { }
+####     timeout { return "timeout while waiting for DISC" }
+####   }
+#### 
+####   send_exp_prompt ${victim} "=node.heap()"
+#### 
+####   return "ok"
+#### } -result "ok"
+# }}}
+
+###############################################################################
+### Deprecated verification and client auth
+###############################################################################
+
+# {{{
+::tcltest::test tls_256v1_bad_verify_deprecated {
+  TLS verify with bad cert
+} -body {
+  set cert [open "${fntls256v1}.crt"]
+  send_exp_prompt_c ${victim} "tls.cert.verify(\[\["
+  while { [gets ${cert} line] >= 0 } {
+    send_exp_prompt_c ${victim} $line
+  }
+  send_exp_prompt ${victim} "]])"
+  close ${cert}
+  send_exp_prompt ${victim} "tls.cert.verify(true)"
+
+  spawn -noecho "socat" "STDIO,cfmakeraw" "OPENSSL-LISTEN:12345,verify=0,certificate=${fntls384r1}.crt,key=${fntls384r1}.key,reuseaddr"
+  send_exp_prompt ${victim} "c = tlsbasic(2,12345,\"${myip}\")"
+
+  expect {
+    -i ${victim} "CONN" { set result "connected instead" }
+    -i ${victim} "RECV" { set result "received instead?" }
+    -i ${victim} "DISC" { set result "ok" }
+  }
+
+  return ${result}
+} -cleanup {
+  send_exp_prompt ${victim} "c:close(); c = nil"
+  close ${spawn_id}
+} -result "ok"
+# }}}
+
+# {{{
+::tcltest::test tls_384r1_verify_deprecated {
+  TLS 384r1, verify
+} -body {
+  set cert [open "${fntls384r1}.crt"]
+  send_exp_prompt_c ${victim} "tls.cert.verify(\[\["
+  while { [gets ${cert} line] >= 0 } {
+    send_exp_prompt_c ${victim} $line
+  }
+  send_exp_prompt ${victim} "]])"
+  close ${cert}
+  send_exp_prompt ${victim} "tls.cert.verify(true)"
+
+  spawn -noecho "socat" "STDIO,cfmakeraw" "OPENSSL-LISTEN:12345,verify=0,certificate=${fntls384r1}.crt,key=${fntls384r1}.key,reuseaddr"
+  send_exp_prompt ${victim} "c = tlsbasic(2,12345,\"${myip}\")"
+  basicconntest 2 ${spawn_id} ${victim} "c"
+} -cleanup {
+  send_exp_prompt ${victim} "c:close(); c = nil"
+  close ${spawn_id}
+} -result "ok"
+# }}}
+
+###############################################################################
+### "New-API" verification
+###############################################################################
+
+# {{{
+::tcltest::test tls_384r1_verify_cb {
+  TLS 384r1, verify, new API, PEM
+} -body {
+  # Disengage deprecated API
+  send_exp_prompt ${victim} "tls.cert.auth(false)"
+  send_exp_prompt ${victim} "tls.cert.verify(false)"
+
+  # This wouldn't work with the old API because the parser refused to recognize
+  # EC keys, but the new interface plumbs things more directly to mbedtls, so
+  # things should be fine.
+
+  send_exp_prompt_c ${victim} "tls.cert.verify(function(ix) return ix == 1 and \[\["
+  set cert [open "${fntls384r1}.crt"]
+  while { [gets ${cert} line] >= 0 } {
+    send_exp_prompt_c ${victim} $line
+  }
+  close ${cert}
+  send_exp_prompt ${victim} "]] end)"
+
+  spawn -noecho "socat" "STDIO,cfmakeraw" "OPENSSL-LISTEN:12345,verify=0,certificate=${fntls384r1}.crt,key=${fntls384r1}.key,reuseaddr"
+  send_exp_prompt ${victim} "c = tlsbasic(4,12345,\"${myip}\")"
+  basicconntest 4 ${spawn_id} ${victim} "c"
+} -cleanup {
+  send_exp_prompt ${victim} "c:close(); c = nil"
+  close ${spawn_id}
+} -result "ok"
+# }}}
+
+# {{{
+::tcltest::test tls_rsa2048_verify_cb {
+  TLS RSA2048, verify, new API, PEM
+} -body {
+  # Disengage deprecated API
+  send_exp_prompt ${victim} "tls.cert.auth(false)"
+  send_exp_prompt ${victim} "tls.cert.verify(false)"
+
+  # This wouldn't work with the old API because the parser refused to recognize
+  # EC keys, but the new interface plumbs things more directly to mbedtls, so
+  # things should be fine.
+
+  send_exp_prompt_c ${victim} "tls.cert.verify(function(ix) return ix == 1 and \[\["
+  set cert [open "${fntlsrsa2}.crt"]
+  while { [gets ${cert} line] >= 0 } {
+    send_exp_prompt_c ${victim} $line
+  }
+  close ${cert}
+  send_exp_prompt ${victim} "]] end)"
+
+  spawn -noecho "socat" "STDIO,cfmakeraw" "OPENSSL-LISTEN:12345,verify=0,certificate=${fntlsrsa2}.crt,key=${fntlsrsa2}.key,reuseaddr"
+  send_exp_prompt ${victim} "c = tlsbasic(7,12345,\"${myip}\")"
+  basicconntest 7 ${spawn_id} ${victim} "c"
+} -cleanup {
+  send_exp_prompt ${victim} "c:close(); c = nil"
+  close ${spawn_id}
+} -result "ok"
+# }}}
+
+# {{{
+::tcltest::test tls_256v1_bad_verify_cb {
+  TLS verify with wrong cert, new API, PEM
+} -body {
+  # Disengage deprecated API
+  send_exp_prompt ${victim} "tls.cert.auth(false)"
+  send_exp_prompt ${victim} "tls.cert.verify(false)"
+
+  # This wouldn't work with the old API because the parser refused to recognize
+  # EC keys, but the new interface plumbs things more directly to mbedtls, so
+  # things should be fine.
+
+  send_exp_prompt_c ${victim} "tls.cert.verify(function(ix) return ix == 1 and \[\["
+  set cert [open "${fntls256v1}.crt"]
+  while { [gets ${cert} line] >= 0 } {
+    send_exp_prompt_c ${victim} $line
+  }
+  close ${cert}
+  send_exp_prompt ${victim} "]] end)"
+
+  spawn -noecho "socat" "STDIO,cfmakeraw" "OPENSSL-LISTEN:12345,verify=0,certificate=${fntls384r1}.crt,key=${fntls384r1}.key,reuseaddr"
+  send_exp_prompt ${victim} "c = tlsbasic(4,12345,\"${myip}\")"
+
+  expect {
+    -i ${victim} "CONN" { set result "connected instead" }
+    -i ${victim} "RECV" { set result "received instead?" }
+    -i ${victim} "DISC" { set result "ok" }
+  }
+
+  return ${result}
+} -cleanup {
+  send_exp_prompt ${victim} "c:close(); c = nil"
+  close ${spawn_id}
+} -result "ok"
+# }}}
+
+###############################################################################
+### "New-API" verification and client certs
+###############################################################################
+
+# {{{
+::tcltest::test tls_256v1_verify_auth_cb {
+  TLS 256v1, verify and present client cert, new API, PEM
+} -body {
+  # Disengage deprecated API
+  send_exp_prompt ${victim} "tls.cert.auth(false)"
+  send_exp_prompt ${victim} "tls.cert.verify(false)"
+
+  # This wouldn't work with the old API because the parser refused to recognize
+  # EC keys, but the new interface plumbs things more directly to mbedtls, so
+  # things should be fine.
+
+  send_exp_prompt_c ${victim} "tls.cert.verify(function(ix) return ix == 1 and \[\["
+  set cert [open "${fntls256v1}.crt"]
+  while { [gets ${cert} line] >= 0 } {
+    send_exp_prompt_c ${victim} $line
+  }
+  close ${cert}
+  send_exp_prompt ${victim} "]] end)"
+
+  send_exp_prompt_c ${victim} "tls.cert.auth(function(ix) if ix == 0 then return \[\["
+  set key [open "${fntls256v1}.key"]
+  while { [gets ${key} line] >= 0 } {
+    send_exp_prompt_c ${victim} $line
+  }
+  close ${key}
+  send_exp_prompt_c ${victim} "]] elseif ix == 1 then return \[\["
+  set cert [open "${fntls256v1}.crt"]
+  while { [gets ${cert} line] >= 0 } {
+    send_exp_prompt_c ${victim} $line
+  }
+  close ${cert}
+  send_exp_prompt ${victim} "]] end end)"
+
+  spawn -noecho "socat" "STDIO,cfmakeraw" "OPENSSL-LISTEN:12345,verify=1,cafile=${fntls256v1}.crt,certificate=${fntls256v1}.crt,key=${fntls256v1}.key,reuseaddr"
+  send_exp_prompt ${victim} "c = tlsbasic(5,12345,\"${myip}\")"
+  basicconntest 5 ${spawn_id} ${victim} "c"
+} -cleanup {
+  send_exp_prompt ${victim} "c:close(); c = nil"
+  close ${spawn_id}
+} -result "ok"
+# }}}
+
+send_exp_prompt ${victim} "collectgarbage()"
+send_exp_prompt ${victim} "=node.heap()"
+
+### MbedTLS won't consider keys below 2048 bytes, which is sort of sad.  Not because
+### I think we should be using them, but because I don't know how to test the DER
+### decoders for EC keys yet.
+###
+### # {{{
+### ::tcltest::test tls_rsa1024_verify_auth_cb_der {
+###   TLS RSA1024, verify and present client cert, new API, DER
+### } -body {
+###   # Disengage deprecated API
+###   send_exp_prompt ${victim} "tls.cert.auth(false)"
+###   send_exp_prompt ${victim} "tls.cert.verify(false)"
+### 
+###   send_exp_prompt_c ${victim} "do"
+###   send_exp_prompt_c ${victim} "  local der = encoder.fromBase64(string.gsub(\[\["
+###   set cert [open "${fntlsrsa1}.crt"]
+###   gets ${cert}
+###   while { [gets ${cert} line] >= 0 } {
+###     if { ! [string equal -length 5 "-----" ${line} ] } {
+###       send_exp_prompt_c ${victim} $line
+###     }
+###   }
+###   close ${cert}
+###   send_exp_prompt_c ${victim} "]],\"%s+\",\"\"))"
+### 
+###   send_exp_res_prompt ${victim} " print(tls.cert.verify(function(ix) return ix == 1 and der end)) end" "true"
+### 
+###   send_exp_prompt_c ${victim} "der0 = encoder.fromBase64(string.gsub(\[\["
+###   set key [open "${fntlsrsa1}.key"]
+###   gets ${key}
+###   while { [gets ${key} line] >= 0 } {
+###     if { ! [string equal -length 5 "-----" ${line} ] } {
+###       send_exp_prompt_c ${victim} $line
+###     }
+###   }
+###   close ${key}
+###   send_exp_prompt ${victim} "]],\"%s+\",\"\"))"
+###   send_exp_res_prompt ${victim} "print(type(der0))" "string"
+### 
+###   send_exp_prompt_c ${victim} "der1 = encoder.fromBase64(string.gsub(\[\["
+###   set cert [open "${fntlsrsa1}.crt"]
+###   gets ${cert}
+###   while { [gets ${cert} line] >= 0 } {
+###     if { ! [string equal -length 5 "-----" ${line} ] } {
+###       send_exp_prompt_c ${victim} $line
+###     }
+###   }
+###   close ${cert}
+###   send_exp_prompt ${victim} "]],\"%s+\",\"\"))"
+###   send_exp_res_prompt ${victim} "print(type(der1))" "string"
+### 
+###   send_exp_prompt_c   ${victim} "print(tls.cert.auth(function(ix)"
+###   send_exp_prompt_c   ${victim} "  if ix == 0 then return der0"
+###   send_exp_prompt_c   ${victim} "  elseif ix == 1 then return der1"
+###   send_exp_res_prompt ${victim} "  end end))" "true"
+### 
+###   send_exp_prompt ${victim} "collectgarbage()"
+###   send_exp_prompt ${victim} "=node.heap()"
+### 
+###   spawn -noecho "socat" "STDIO,cfmakeraw" "OPENSSL-LISTEN:12345,verify=1,cafile=${fntlsrsa1}.crt,certificate=${fntlsrsa1}.crt,key=${fntlsrsa1}.key,reuseaddr"
+###   send_exp_prompt ${victim} "c = tlsbasic(6,12345,\"${myip}\")"
+###   basicconntest 6 ${spawn_id} ${victim} "c"
+### } -cleanup {
+###   send_exp_prompt ${victim} "if c then c:close(); c = nil end"
+###   # der0 = nil; der1 = nil"
+###   close ${spawn_id}
+### } -result "ok"
+### # }}}
+
+###############################################################################
+send_exp_prompt ${victim} "collectgarbage()"
+::tcltest::cleanupTests
