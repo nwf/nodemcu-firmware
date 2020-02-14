@@ -1,0 +1,197 @@
+#!/usr/bin/env expect
+
+# Walk a NodeMCU device through some basic NET functionality tests using an
+# existing wifi network.
+#
+# Requires `socat` on the host side; tested only on Linux.
+#
+# A typical invocation looks like:
+#   export NODEMCU_TESTTMP=/tmp/nodemcu
+#   ./preflight-tls.sh
+#   TCLLIBPATH=./expectnmcu ./test-net.expect -serial /dev/ttyUSB3 -wifi "$(cat wificmd)"
+#
+# where the file `wificmd` contains something like
+#  wifi.setmode(wifi.STATION); wifi.sta.config({...}); wifi.sta.connect()
+# where the ... is filled in with the local network's configuration.  All on
+# one line, tho', so that the script just gets one prompt back.
+#
+# For debugging the test itself, it may be useful to invoke expect with -d,
+# which will give a great deal of diagnostic information about the expect state
+# machine's internals:
+#   TCLLIBPATH=./expectnmcu expect -d ./tls-test.expect ...
+
+package require struct::stack
+package require expectnmcu::core
+  namespace import expectnmcu::core::send_exp_prompt
+  namespace import expectnmcu::core::send_exp_prompt_c
+  namespace import expectnmcu::core::send_exp_res_prompt
+package require expectnmcu::net
+package require Tclx
+package require tcltest
+
+::struct::stack ulogstack
+proc pushulog { new } {
+  ulogstack push [log_user -info]
+  log_user ${new}
+}
+proc populog { } { log_user [ulogstack pop] }
+
+# Basic connectivity test, including disconnection of localsid.
+proc basicconntest { id localsid victimsid victimconn } {
+  set timeout 15
+  expect {
+    -i ${localsid} -re ".+" {
+      # If socat says anything, it's almost surely an error
+      exit 1
+    }
+    -i ${victimsid} "CONN\t${id}" { }
+  }
+  set timeout 2
+  pushulog 0
+  expect {
+    -i ${localsid} "GET / HTTP/1.0\r\n\r\n" {
+      send -i ${localsid} "abracadabra"
+    }
+  }
+  populog
+  expect {
+    -i ${victimsid} "RECV\t${id}\tabracadabra" {
+      send_exp_prompt ${victimsid} "${victimconn}:send(\"test 1 2 3 4\")"
+    }
+  }
+  pushulog 0
+  expect {
+    -i ${localsid} "test 1 2 3 4" {
+      close -i ${localsid}
+    }
+  }
+  populog
+  set timeout 15
+  expect {
+    -i ${victimsid} "DISC\t${id}" { }
+  }
+}
+
+package require cmdline
+set cmd_parameters {
+  { serial.arg "/dev/ttyUSB0"   "Set the serial interface name" }
+  { wifi.arg   ""               "Command to run to bring up the network" }
+  { ip.arg     ""               "My IP address (will guess if not given)" }
+  { tcfg.arg   ""               "Specify key/value pairs for tcltest config" }
+  { noboot                      "Do not reboot the DUT" }
+}
+set cmd_usage "- A NodeMCU net test program"
+if {[catch {array set cmdopts [cmdline::getoptions ::argv $cmd_parameters $cmd_usage]}]} {
+  send_user [cmdline::usage $cmd_parameters $cmd_usage]
+  exit 0
+}
+
+foreach {k v} [split ${cmdopts(tcfg)}] { ::tcltest::configure ${k} ${v} }
+
+set victim [::expectnmcu::core::connect ${cmdopts(serial)} \
+              -reboot [expr ${cmdopts(noboot)} ? 0 : 1] ]
+send_user "\n===> Machine has booted <===\n"
+
+# Load some Lua into the device for us to steer
+
+  # TCP client
+  send_exp_prompt_c ${victim} "function ttcpc(id,port,host)"
+  send_exp_prompt_c ${victim} "  local c = net.createConnection()"
+  send_exp_prompt_c ${victim} "  c:on(\"receive\", function(sck, d) print(\"RECV\",id,d) end)"
+  send_exp_prompt_c ${victim} "  c:on(\"sent\", function(sck) print(\"SENT\",id) end)"
+  send_exp_prompt_c ${victim} "  c:on(\"connection\", function(sck) print(\"CONN\",id); sck:send(\"GET / HTTP/1.0\\r\\n\\r\\n\") end)"
+  send_exp_prompt_c ${victim} "  c:on(\"reconnection\", function(sck,ec) print(\"RECN\",id,ec) end)"
+  send_exp_prompt_c ${victim} "  c:on(\"disconnection\", function(sck,ec) print(\"DISC\",id,ec) end)"
+  send_exp_prompt_c ${victim} "  c:connect(port,host)"
+  send_exp_prompt_c ${victim} "  return c"
+  send_exp_prompt   ${victim} "end"
+
+  # TCP Server
+  send_exp_prompt_c ${victim} "function ttcps(id,port)"
+  send_exp_prompt_c ${victim} "  local c = net.createServer()"
+  send_exp_prompt_c ${victim} "  return c"
+  send_exp_prompt   ${victim} "end"
+
+  # UDP socket
+  send_exp_prompt_c ${victim} "function tudp(id,port)"
+  send_exp_prompt_c ${victim} "  local c = net.createUDPSocket()"
+  send_exp_prompt_c ${victim} "  return c"
+  send_exp_prompt   ${victim} "end"
+
+# Connect the board to the network
+
+if {0 < [string length ${cmdopts(wifi)}]} {
+  send_exp_prompt ${victim} ${cmdopts(wifi)}
+}
+set victimip [::expectnmcu::net::waitwifista ${victim}]
+send_user "\n===> Victim IP address ${victimip} <===\n"
+
+if {0 < [string length ${cmdopts(ip)}]} {
+  set myip ${cmdopts(ip)}
+} else {
+  set myip [::expectnmcu::net::guessmyip ${victimip}]
+}
+
+set myname [host_info official_name ${myip}]
+
+# {{{
+::tcltest::test ifinfo {
+  Basic test of net.ifinfo
+} -body {
+  send_exp_res_prompt ${victim} "=(net.ifinfo(0).ip == \"${victimip}\")" "true"
+  return "ok"
+} -result "ok"
+# }}}
+
+# {{{
+::tcltest::test ping_host_ip {
+  Ping the host by IP
+} -body {
+  send_exp_prompt_c ${victim} "net.ping(\"${myip}\", 2,"
+  send_exp_prompt_c ${victim} " function(...) print(\"RECV\", ...),"
+  send_exp_prompt   ${victim} " function(...) print(\"SENT\", ...))"
+
+  set res 0
+  expect {
+    -i ${victim} -re "RECV" {
+      incr res
+      exp_continue
+    }
+    -i ${victim} -re "SENT" {
+      incr res
+    }
+  }
+
+  return ${res}
+} -result 5
+# }}}
+
+# {{{
+::tcltest::test dns_resolve {
+  Ask the DUT to resolve the name we guessed for ourselves
+} -body {
+  send_exp_prompt_c ${victim} "net.dns.resolve(\"${myname}\", function(n,i)"
+  send_exp_prompt ${victim} "  print(\"DNS\", i, \"SND\") end)"
+
+  expect {
+    -i ${victim} -re "DNS\[ \t\]+(\[^ \t\n\r\]+)\[ \t\]+SND" {
+      return ${expect_out(1,string)}
+    }
+  }
+
+} -result ${myip}
+# }}}
+
+# {{{
+::tcltest::test tcp_basic {
+  Make a TCP client on the device and connect to the host.
+} -body {
+  spawn -noecho "socat" "STDIO,cfmakeraw" "TCP-LISTEN:12345,reuseaddr"
+  send_exp_prompt ${victim} "c = ttcpc(0,12345,\"${myip}\")"
+  basicconntest 0 ${spawn_id} ${victim} "c"
+  return "ok"
+} -result "ok"
+# }}}
+
+
+::tcltest::cleanupTests
