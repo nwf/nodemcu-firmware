@@ -8,6 +8,7 @@
 #include "platform.h"
 #include "lmem.h"
 
+#include <ctype.h>
 #include <string.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -40,6 +41,7 @@ typedef struct {
   int cb_sent_ref;
   int cb_receive_ref;
   int cb_dns_ref;
+  uint8_t refcount;   /* References held by other bits of C */
 } tls_socket_ud;
 
 static int tls_socket_create( lua_State *L ) {
@@ -55,102 +57,164 @@ static int tls_socket_create( lua_State *L ) {
   ud->cb_receive_ref =
   ud->cb_dns_ref = LUA_NOREF;
 
+  ud->refcount = 0;
+
   luaL_getmetatable(L, "tls.socket");
   lua_setmetatable(L, -2);
 
   return 1;
 }
 
-static void tls_socket_onconnect( struct espconn *pesp_conn ) {
-  tls_socket_ud *ud = (tls_socket_ud *)pesp_conn;
-  if (!ud || ud->self_ref == LUA_NOREF) return;
-  if (ud->cb_connect_ref != LUA_NOREF) {
-    lua_State *L = lua_getstate();
-    lua_rawgeti(L, LUA_REGISTRYINDEX, ud->cb_connect_ref);
-    lua_rawgeti(L, LUA_REGISTRYINDEX, ud->self_ref);
-    lua_call(L, 1, 0);
-  }
-}
-
+/*
+ * Disconnect and unhook this socket from the Lua side of the world.  Lua...
+ *
+ *   - may have dropped all their references to this socket, in which case,
+ *   this is getting pretty near the last time we'll ever hear of this object
+ *   (except the tls_socket_delete __gc metamethod, below).
+ *
+ *   - may retain a reference to this socket; we'll re-allocate the tcp state
+ *   in tls_socket_connect, below.
+ *
+ * It is, therefore, important that if any code references ud after calling
+ * this method that they be very sure that a reference is held on the Lua
+ * stack!
+ */
 static void tls_socket_cleanup(tls_socket_ud *ud) {
+  NODE_DBG("tls_socket_cleanup %p w=%d\n", ud, ud->refcount);
+
+  /* Wait for C to drop its references (DNS or espconn) */
+  if (ud->refcount != 0)
+   return;
+
   if (ud->pesp_conn.proto.tcp) {
-    espconn_secure_disconnect(&ud->pesp_conn);
     free(ud->pesp_conn.proto.tcp);
     ud->pesp_conn.proto.tcp = NULL;
   }
-  lua_State *L = lua_getstate();
-  lua_gc(L, LUA_GCSTOP, 0);
-  luaL_unref(L, LUA_REGISTRYINDEX, ud->self_ref);
+
+  int selfref = ud->self_ref;
   ud->self_ref = LUA_NOREF;
-  lua_gc(L, LUA_GCRESTART, 0);
+  luaL_unref(lua_getstate(), LUA_REGISTRYINDEX, selfref);
 }
 
-static void tls_socket_ondisconnect( struct espconn *pesp_conn ) {
-  tls_socket_ud *ud = (tls_socket_ud *)pesp_conn;
-  if (!ud || ud->self_ref == LUA_NOREF) return;
-  tls_socket_cleanup(ud);
-  if (ud->cb_disconnect_ref != LUA_NOREF) {
-    lua_State *L = lua_getstate();
-    lua_rawgeti(L, LUA_REGISTRYINDEX, ud->cb_disconnect_ref);
-    lua_rawgeti(L, LUA_REGISTRYINDEX, ud->self_ref);
-    tls_socket_cleanup(ud);
-    lua_call(L, 1, 0);
-  } else tls_socket_cleanup(ud);
-}
+/*
+ * Call the "last gasp" callbacks and tear down the socket state, returning it
+ * to its pre-connect state.
+ *
+ * Like `net`, make "disconnection" get everything unless there's a
+ * "reconnection" callback registered, in which case, "disconnection" gets only
+ * the ordinary disconnection events (i.e., those with no errstr).
+ */
+static void tls_socket_last_call(tls_socket_ud *ud, const char *errstr) {
+  int cbref = ud->cb_disconnect_ref;
+  if ((errstr != NULL) && (ud->cb_reconnect_ref != LUA_NOREF)) {
+    cbref = ud->cb_reconnect_ref;
+  }
 
-static void tls_socket_onreconnect( struct espconn *pesp_conn, s8 err ) {
-  tls_socket_ud *ud = (tls_socket_ud *)pesp_conn;
-  if (!ud || ud->self_ref == LUA_NOREF) return;
-  if (ud->cb_reconnect_ref != LUA_NOREF) {
-    const char* reason = NULL;
-    switch (err) {
-      case(ESPCONN_MEM): reason = "Out of memory"; break;
-      case(ESPCONN_TIMEOUT): reason = "Timeout"; break;
-      case(ESPCONN_RTE): reason = "Routing problem"; break;
-      case(ESPCONN_ABRT): reason = "Connection aborted"; break;
-      case(ESPCONN_RST): reason = "Connection reset"; break;
-      case(ESPCONN_CLSD): reason = "Connection closed"; break;
-      case(ESPCONN_HANDSHAKE): reason = "SSL handshake failed"; break;
-      case(ESPCONN_SSL_INVALID_DATA): reason = "SSL application invalid"; break;
-    }
+  NODE_DBG("tls_socket_last_call %p %d '%s'\n", ud, cbref,
+           errstr ? errstr : "No error");
+
+  if (cbref != LUA_NOREF) {
     lua_State *L = lua_getstate();
-    lua_rawgeti(L, LUA_REGISTRYINDEX, ud->cb_reconnect_ref);
+    lua_rawgeti(L, LUA_REGISTRYINDEX, cbref);
     lua_rawgeti(L, LUA_REGISTRYINDEX, ud->self_ref);
-    if (reason != NULL) {
-      lua_pushstring(L, reason);
+    if (errstr != NULL) {
+      lua_pushstring(L, errstr);
     } else {
       lua_pushnil(L);
     }
     tls_socket_cleanup(ud);
     lua_call(L, 2, 0);
-  } else tls_socket_cleanup(ud);
+  } else {
+    tls_socket_cleanup(ud);
+  }
+}
+
+static void tls_socket_onconnect( struct espconn *pesp_conn ) {
+  tls_socket_ud *ud = (tls_socket_ud *)pesp_conn;
+
+  NODE_DBG("tls_socket_onconnect %p w=%d\n", ud, ud->refcount);
+
+  if (ud->cb_connect_ref != LUA_NOREF) {
+    lua_State *L = lua_getstate();
+    lua_rawgeti(L, LUA_REGISTRYINDEX, ud->cb_connect_ref);
+    lua_rawgeti(L, LUA_REGISTRYINDEX, ud->self_ref);
+    lua_call(L, 1, 0);
+  } else if ((ud->cb_disconnect_ref == LUA_NOREF) &&
+             (ud->cb_sent_ref == LUA_NOREF) &&
+             (ud->cb_receive_ref == LUA_NOREF)) {
+    espconn_secure_disconnect(&ud->pesp_conn);
+  }
+}
+
+static void tls_socket_ondisconnect( struct espconn *pesp_conn ) {
+  tls_socket_ud *ud = (tls_socket_ud *)pesp_conn;
+
+  NODE_DBG("tls_socket_ondisconnect %p w=%d\n", ud, ud->refcount);
+
+  ud->refcount--; // ESP goo has released handle
+  tls_socket_last_call(ud, NULL);
+}
+
+static void tls_socket_onreconnect( struct espconn *pesp_conn, s8 err ) {
+  const char* reason = "Unknown error";
+  switch (err) {
+    case(ESPCONN_MEM): reason = "Out of memory"; break;
+    case(ESPCONN_TIMEOUT): reason = "Timeout"; break;
+    case(ESPCONN_RTE): reason = "Routing problem"; break;
+    case(ESPCONN_ABRT): reason = "Connection aborted"; break;
+    case(ESPCONN_RST): reason = "Connection reset"; break;
+    case(ESPCONN_CLSD): reason = "Connection closed"; break;
+    case(ESPCONN_HANDSHAKE): reason = "SSL handshake failed"; break;
+    case(ESPCONN_SSL_INVALID_DATA): reason = "SSL application invalid"; break;
+  }
+
+  tls_socket_ud *ud = (tls_socket_ud *)pesp_conn;
+
+  NODE_DBG("tls_socket_onreconnect %p w=%d e=%d(%s)\n", ud, ud->refcount, err, reason);
+
+  ud->refcount--; // ESP goo has released handle
+  tls_socket_last_call(ud, reason);
 }
 
 static void tls_socket_onrecv( struct espconn *pesp_conn, char *buf, u16 length ) {
   tls_socket_ud *ud = (tls_socket_ud *)pesp_conn;
-  if (!ud || ud->self_ref == LUA_NOREF) return;
+
+  NODE_DBG("tls_socket_onrecv %p w=%d\n", ud, ud->refcount);
+
   if (ud->cb_receive_ref != LUA_NOREF) {
     lua_State *L = lua_getstate();
     lua_rawgeti(L, LUA_REGISTRYINDEX, ud->cb_receive_ref);
     lua_rawgeti(L, LUA_REGISTRYINDEX, ud->self_ref);
     lua_pushlstring(L, buf, length);
     lua_call(L, 2, 0);
+  } else if ((ud->cb_disconnect_ref == LUA_NOREF) &&
+             (ud->cb_sent_ref == LUA_NOREF)) {
+    espconn_secure_disconnect(&ud->pesp_conn);
   }
 }
 
 static void tls_socket_onsent( struct espconn *pesp_conn ) {
   tls_socket_ud *ud = (tls_socket_ud *)pesp_conn;
-  if (!ud || ud->self_ref == LUA_NOREF) return;
+
+  NODE_DBG("tls_socket_onsent %p w=%d\n", ud, ud->refcount);
+
   if (ud->cb_sent_ref != LUA_NOREF) {
     lua_State *L = lua_getstate();
     lua_rawgeti(L, LUA_REGISTRYINDEX, ud->cb_sent_ref);
     lua_rawgeti(L, LUA_REGISTRYINDEX, ud->self_ref);
     lua_call(L, 1, 0);
+  } else if ((ud->cb_disconnect_ref == LUA_NOREF) &&
+             (ud->cb_receive_ref == LUA_NOREF)) {
+    espconn_secure_disconnect(&ud->pesp_conn);
   }
 }
 
-static void tls_socket_dns_cb( const char* domain, const ip_addr_t *ip_addr, tls_socket_ud *ud ) {
-  if (ud->self_ref == LUA_NOREF) return;
+static void tls_socket_ondns( const char* domain, ip_addr_t *ip_addr, void *arg) {
+  tls_socket_ud *ud = arg;
+  NODE_DBG("tls_socket_ondns %p w=%d\n", ud, ud->refcount);
+
+  ud->refcount--;
+
   ip_addr_t addr;
   if (ip_addr) addr = *ip_addr;
   else addr.addr = 0xFFFFFFFF;
@@ -167,36 +231,65 @@ static void tls_socket_dns_cb( const char* domain, const ip_addr_t *ip_addr, tls
     }
     lua_call(L, 2, 0);
   }
+
+  if ((ud->cb_disconnect_ref == LUA_NOREF) &&
+      (ud->cb_connect_ref == LUA_NOREF) &&
+      (ud->cb_sent_ref == LUA_NOREF) &&
+      (ud->cb_receive_ref == LUA_NOREF)) {
+    /* Directly call last_call here, not _disconnect because we're not connected */
+    tls_socket_last_call(ud, "No callbacks");
+    return;
+  }
+
   if (addr.addr == 0xFFFFFFFF) {
-    lua_gc(L, LUA_GCSTOP, 0);
-    luaL_unref(L, LUA_REGISTRYINDEX, ud->self_ref);
-    ud->self_ref = LUA_NOREF;
-    lua_gc(L, LUA_GCRESTART, 0);
+    tls_socket_last_call(ud, "DNS failure");
   } else {
     os_memcpy(ud->pesp_conn.proto.tcp->remote_ip, &addr.addr, 4);
-    espconn_secure_connect(&ud->pesp_conn);
+
+    /* Additionally referenced by ESP goo until disconn or reconn callback */
+    ud->refcount++;
+    int res = espconn_secure_connect(&ud->pesp_conn);
+    switch(res) {
+    case ESPCONN_OK:
+      return;
+    default:
+      return tls_socket_onreconnect(&ud->pesp_conn, res);
+    }
   }
 }
 
 static int tls_socket_connect( lua_State *L ) {
   tls_socket_ud *ud = (tls_socket_ud *)luaL_checkudata(L, 1, "tls.socket");
+
+  NODE_DBG("tls_socket_connect %p w=%d\n", ud, ud->refcount);
+
   if (ud->pesp_conn.proto.tcp) {
     return luaL_error(L, "already connected");
   }
 
   u16 port = luaL_checkinteger( L, 2 );
-  size_t il;
-  const char *domain = "127.0.0.1";
-  if( lua_isstring(L, 3) )
-    domain = luaL_checklstring( L, 3, &il );
   if (port == 0)
     return luaL_error(L, "invalid port");
+
+  size_t il;
+  const char *domain = luaL_checklstring( L, 3, &il );
   if (domain == NULL)
     return luaL_error(L, "invalid domain");
+
+  /*
+   * Anchor this socket in the lua registry while callbacks exist.  This might
+   * OOM if the registry needs to expand.  As such, do this before we allocate,
+   * below, and unwire if the allocation fails.
+   */
+  if (ud->self_ref == LUA_NOREF) {
+    lua_pushvalue(L, 1);  // copy to the top of stack
+    ud->self_ref = luaL_ref(L, LUA_REGISTRYINDEX);
+  }
 
   ud->pesp_conn.proto.udp = NULL;
   ud->pesp_conn.proto.tcp = (esp_tcp *)calloc(1,sizeof(esp_tcp));
   if(!ud->pesp_conn.proto.tcp){
+    tls_socket_cleanup(ud);
     return luaL_error(L, "not enough memory");
   }
   ud->pesp_conn.type = ESPCONN_TCP;
@@ -208,17 +301,13 @@ static int tls_socket_connect( lua_State *L ) {
   espconn_regist_recvcb(&ud->pesp_conn, (espconn_recv_callback)tls_socket_onrecv);
   espconn_regist_sentcb(&ud->pesp_conn, (espconn_sent_callback)tls_socket_onsent);
 
-  if (ud->self_ref == LUA_NOREF) {
-    lua_pushvalue(L, 1);  // copy to the top of stack
-    ud->self_ref = luaL_ref(L, LUA_REGISTRYINDEX);
-  }
-
+  ud->refcount++;
   ip_addr_t addr;
-  err_t err = dns_gethostbyname(domain, &addr, (dns_found_callback)tls_socket_dns_cb, ud);
+  err_t err = dns_gethostbyname(domain, &addr, tls_socket_ondns, ud);
   if (err == ERR_OK) {
-    tls_socket_dns_cb(domain, &addr, ud);
+    tls_socket_ondns(domain, &addr, ud);
   } else if (err != ERR_INPROGRESS) {
-    tls_socket_dns_cb(domain, NULL, ud);
+    tls_socket_ondns(domain, NULL, ud);
   }
 
   return 0;
@@ -226,6 +315,7 @@ static int tls_socket_connect( lua_State *L ) {
 
 static int tls_socket_on( lua_State *L ) {
   tls_socket_ud *ud = (tls_socket_ud *)luaL_checkudata(L, 1, "tls.socket");
+
   size_t sl;
   const char *method = luaL_checklstring( L, 2, &sl );
   int *cbp;
@@ -258,6 +348,7 @@ static int tls_socket_send( lua_State *L ) {
   tls_socket_ud *ud = (tls_socket_ud *)luaL_checkudata(L, 1, "tls.socket");
   size_t sl;
   const char* buf = luaL_checklstring(L, 2, &sl);
+
   if(ud->pesp_conn.proto.tcp == NULL) {
     NODE_DBG("not connected");
     return 0;
@@ -269,7 +360,7 @@ static int tls_socket_send( lua_State *L ) {
 
 static int tls_socket_hold( lua_State *L ) {
   tls_socket_ud *ud = (tls_socket_ud *)luaL_checkudata(L, 1, "tls.socket");
-  luaL_argcheck(L, ud, 1, "TLS socket expected");
+
   if(ud->pesp_conn.proto.tcp == NULL) {
     NODE_DBG("not connected");
     return 0;
@@ -308,20 +399,26 @@ static int tls_socket_getpeer( lua_State *L ) {
 
 static int tls_socket_close( lua_State *L ) {
   tls_socket_ud *ud = (tls_socket_ud *)luaL_checkudata(L, 1, "tls.socket");
+
+  NODE_DBG("tls_socket_close %p\n", ud);
+
   if (ud->pesp_conn.proto.tcp) {
+    /*
+     * This, eventually, results in calling the "last-call" callbacks through
+     * the ESP glue (on a different task).  That path will eventually crawl up
+     * to tls_socket_cleanup(), so don't do the cleanup here, so that we do
+     * fire off the callbacks on the posted task.  See the note in
+     * tls_socket_cleanup() about its lack of reentrancy.
+     */
     espconn_secure_disconnect(&ud->pesp_conn);
   }
-
   return 0;
 }
 
 static int tls_socket_delete( lua_State *L ) {
   tls_socket_ud *ud = (tls_socket_ud *)luaL_checkudata(L, 1, "tls.socket");
-  if (ud->pesp_conn.proto.tcp) {
-    espconn_secure_disconnect(&ud->pesp_conn);
-    free(ud->pesp_conn.proto.tcp);
-    ud->pesp_conn.proto.tcp = NULL;
-  }
+
+  NODE_DBG("tls_socket_delete %p\n", ud);
 
   luaL_unref(L, LUA_REGISTRYINDEX, ud->cb_connect_ref);
   ud->cb_connect_ref = LUA_NOREF;
@@ -336,10 +433,14 @@ static int tls_socket_delete( lua_State *L ) {
   luaL_unref(L, LUA_REGISTRYINDEX, ud->cb_sent_ref);
   ud->cb_sent_ref = LUA_NOREF;
 
-  lua_gc(L, LUA_GCSTOP, 0);
-  luaL_unref(L, LUA_REGISTRYINDEX, ud->self_ref);
-  ud->self_ref = LUA_NOREF;
-  lua_gc(L, LUA_GCRESTART, 0);
+  /*
+   * self-ref must have already been dropped, else we won't end up here,
+   * because there's still a reference to us.  Don't attempt to drop it.
+   *
+   * Since the only way for self-ref to have been dropped is for
+   * tls_socket_cleanup() to have been called, there's no need to contemplate
+   * the pesp_conn.proto.tcp dynamic allocatin, either.
+   */
 
   return 0;
 }
@@ -467,7 +568,7 @@ static int tls_cert_auth(lua_State *L)
     luaL_unref(L, LUA_REGISTRYINDEX, ssl_client_options.cert_auth_callback);
     ssl_client_options.cert_auth_callback = LUA_NOREF;
   }
-  if (lua_type(L, 1) == LUA_TFUNCTION) {
+  if (lua_isfunction(L, 1)) {
     ssl_client_options.cert_auth_callback = luaL_ref(L, LUA_REGISTRYINDEX);
     lua_pushboolean(L, true);
     return 1;
@@ -521,7 +622,7 @@ static int tls_cert_verify(lua_State *L)
     luaL_unref(L, LUA_REGISTRYINDEX, ssl_client_options.cert_verify_callback);
     ssl_client_options.cert_verify_callback = LUA_NOREF;
   }
-  if (lua_type(L, 1) == LUA_TFUNCTION) {
+  if (lua_isfunction(L, 1)) {
     ssl_client_options.cert_verify_callback = luaL_ref(L, LUA_REGISTRYINDEX);
     lua_pushboolean(L, true);
     return 1;
