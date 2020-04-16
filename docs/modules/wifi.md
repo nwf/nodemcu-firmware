@@ -816,7 +816,7 @@ do
   print("\n Number of APs stored in flash:", x.qty)
   print(string.format("  %-6s %-32s %-64s %-18s", "index:", "SSID:", "Password:", "BSSID:"))
   for i=1, (x.qty), 1 do
-    print(string.format(" %s%-6d %-32s %-64s %-18s",(i==y and ">" or " "), i, x[i].ssid, x[i].pwd and x[i].pwd or type(nil), x[i].bssid and x[i].bssid or type(nil)))
+    print(string.format(" %s%-6d %-32s %-64s %-18s",(i==y and ">" or " "), i, x[i].ssid, x[i].pwd or "nil", x[i].bssid or "nil"))
   end
 end
 ```

@@ -672,8 +672,10 @@ static int wifi_station_get_ap_info4lua( lua_State* L )
   lua_newtable(L);
   lua_pushinteger(L, number_of_aps);
   lua_setfield(L, -2, "qty");
+#if defined(WIFI_DEBUG)
   WIFI_DBG("\n\t# of APs stored in flash:%d\n", number_of_aps);
   WIFI_DBG(" %-6s %-32s %-64s %-17s\n", "index:", "ssid:", "password:", "bssid:");
+#endif
 
   for(int i=0;i<number_of_aps;i++)
   {
@@ -716,7 +718,7 @@ static int wifi_station_get_ap_info4lua( lua_State* L )
   return 1;
 }
 
-// Lua: wifi.setapnumber(number_of_aps_to_save)
+// Lua: wifi.sta.setaplimit(number_of_aps_to_save)
 static int wifi_station_ap_number_set4lua( lua_State* L )
 {
   unsigned limit=luaL_checkinteger(L, 1);
@@ -725,7 +727,7 @@ static int wifi_station_ap_number_set4lua( lua_State* L )
   return 1;
 }
 
-// Lua: wifi.setapnumber(number_of_aps_to_save)
+// Lua: wifi.sta.changeap(ap_index) -> boolean (ok)
 static int wifi_station_change_ap( lua_State* L )
 {
   uint8 ap_index=luaL_checkinteger(L, 1);
@@ -734,7 +736,7 @@ static int wifi_station_change_ap( lua_State* L )
   return 1;
 }
 
-// Lua: wifi.setapnumber(number_of_aps_to_save)
+// Lua: wifi.sta.getapindex() -> int (ap index)
 static int wifi_station_get_ap_index( lua_State* L )
 {
   lua_pushinteger(L, wifi_station_get_current_ap_id()+1);
@@ -784,7 +786,7 @@ static int wifi_station_getconfig( lua_State* L, bool get_flash_cfg)
   if(sta_conf.ssid==0)
   {
     lua_pushnil(L);
-      return 1;
+    return 1;
   }
   else
   {
