@@ -1,0 +1,106 @@
+#!/usr/bin/env expect
+
+# Walk a pair of NodeMCU devices through intermodule connectivity tests.  This
+# involves bringing one device up as an AP/DHCP server and the other as a
+# STA/DHCP client and having them make listen for and make connections to the
+# other.
+#
+# A typical invocation looks like:
+#   TCLLIBPATH=./expectnmcu ./test-net-intermodule.expect -serial0 /dev/ttyUSB3 -serial1 /dev/ttyUSB2
+
+package require struct::stack
+package require expectnmcu::core
+  namespace import expectnmcu::core::send_exp_prompt
+  namespace import expectnmcu::core::send_exp_prompt_c
+package require expectnmcu::net
+package require Tclx
+package require tcltest
+
+::struct::stack ulogstack
+proc pushulog { new } {
+  ulogstack push [log_user -info]
+  log_user ${new}
+}
+proc populog { } { log_user [ulogstack pop] }
+
+package require cmdline
+set cmd_parameters {
+  { serial0.arg "/dev/ttyUSB0"   "Set the serial interface name for device 0" }
+  { serial1.arg "/dev/ttyUSB1"   "Set the serial interface name for device 1" }
+  { tcfg.arg   ""               "Specify key/value pairs for tcltest config" }
+}
+set cmd_usage "- A NodeMCU inter-module network test program"
+if {[catch {array set cmdopts [cmdline::getoptions ::argv $cmd_parameters $cmd_usage]}]} {
+  send_user [cmdline::usage $cmd_parameters $cmd_usage]
+  exit 0
+}
+
+foreach {k v} [split ${cmdopts(tcfg)}] { ::tcltest::configure ${k} ${v} }
+
+set victim0 [::expectnmcu::core::connect ${cmdopts(serial0)} -reboot dontwait]
+set victim0 [::expectnmcu::core::connect ${cmdopts(serial1)} -reboot dontwait]
+::expectnmcu::core::waitboot ${victim0}
+::expectnmcu::core::waitboot ${victim1}
+send_user "\n===> Machines booted <===\n"
+
+# Register event monitors on both DUTs
+proc do_wem_all { victim } {
+  send_exp_prompt_c ${victim} "function dowem(ev)"
+  send_exp_prompt_c ${victim} "  wifi.eventmon.register(wifi.eventmon[x],"
+  send_exp_prompt_c ${victim} "    function(t) print(\"WEM BEGIN:\", t);"
+  send_exp_prompt_c ${victim} "      for k,v in pairs(t) do print(k,v) end"
+  send_exp_prompt_c ${victim} "      print(\"WEM END\")"
+  send_exp_prompt_c ${victim} "    end)"
+  send_exp_prompt   ${victim} "end"
+  foreach {ev} {
+    STA_CONNECTED
+    STA_DISCONNECTED
+    STA_AUTHMODE_CHANGE
+    STA_GOT_IP
+    STA_DHCP_TIMEOUT
+    AP_STACONNECTED
+    AP_STADISCONNECTED
+    AP_PROBEREQRECVED
+  } {
+    send_exp_prompt   ${victim} "dowem(${ev})"
+  }
+}
+
+do_wem_all ${victim0}
+do_wem_all ${victim1}
+
+expect_after {
+  timeout { return "timeout" }
+  eof { return "eof" }
+}
+
+# {{{
+::tcltest::test dut1_ap_clear {
+  DUT1 to AP mode, no security
+} -body {
+  send_exp_prompt ${victim1} "wifi.ap.setip{ip=\"192.168.1.1\",netmask=\"255.255.255.0\",gateway=\"0.0.0.0\"}"
+  send_exp_prompt ${victim1} "wifi.ap.config{ssid=\"NMCUTEST\",save=false}"
+  send_exp_prompt ${victim1} "wifi.setmode(wifi.SOFTAP)"
+  return "ok"
+} -result "ok"
+# }}}
+
+# {{{
+::tcltest::test dut0_sta_clear {
+  DUT0 to STA mode, no security
+} -body {
+  send_exp_prompt ${victim0} "wifi.sta.config{ssid=\"NMCUTEST\",save=false}"
+  send_exp_prompt ${victim0} "wifi.setmode(wifi.STATION)"
+
+  expect -i ${victim1} "WEM BEGIN\tAP_STACONNECTED" { }
+  expect -i ${victim1} "WEM END" { }
+  expect -i ${victim0} "WEM BEGIN\tSTA_CONNECTED" { }
+  expect -i ${victim0} "WEM END" { }
+  expect -i ${victim0} "WEM BEGIN\tSTA_GOT_IP" { }
+  expect -i ${victim0} "WEM END" { }
+
+  return "ok"
+} -result "ok"
+# }}}
+
+::tcltest::cleanupTests
