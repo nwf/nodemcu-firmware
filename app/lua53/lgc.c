@@ -1142,11 +1142,11 @@ extern void dbg_printf(const char *fmt, ...);
 #endif                 /*DEBUG*/
 void luaC_step (lua_State *L) {
   global_State *g = G(L);
-  l_mem debt = getdebt(g);  /* GC deficit (be paid now) */
   if (!g->gcrunning) {  /* not running? */
     luaE_setdebt(g, -GCSTEPSIZE * 10);  /* avoid being called too often */
     return;
   }
+  l_mem debt = getdebt(g);  /* GC deficit (be paid now) */
   do {  /* repeat until pause or enough "credit" (negative debt) */
 /*DEBUG  int32_t start = CCOUNT_REG; */
     lu_mem work = singlestep(L);  /* perform one single step */

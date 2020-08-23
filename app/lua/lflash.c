@@ -443,7 +443,7 @@ void procSecondPass (void) {
 }
 
 /*
- * loadLFS)() is protected called from luaL_lfsreload() so that it can recover
+ * loadLFS() is protected called from luaL_lfsreload() so that it can recover
  * from out of memory and other thrown errors.  loadLFSgc() GCs any resources.
  */
 static int loadLFS (lua_State *L) {
