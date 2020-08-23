@@ -55,6 +55,7 @@ cat > $TEMPFILE << EndOfMessage
 
 #define NODE_VERSION_LONG \\
   USER_PROLOG "\n" \\
+  "\tlua: " LUA_VERSION "\n" \\
   "\tbranch: " BUILDINFO_BRANCH "\n" \\
   "\tcommit: " BUILDINFO_COMMIT_ID "\n" \\
   "\trelease: " BUILDINFO_RELEASE "\n" \\
