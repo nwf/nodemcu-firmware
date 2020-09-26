@@ -48,6 +48,9 @@ extern LROT_TABLE(co_funcs);
 extern LROT_TABLE(mathlib);
 extern LROT_TABLE(utf8);
 
+extern LROT_TABLE(pixbuf_map);
+extern int luaopen_pixbuf(lua_State *);
+
 #define LROT_ROM_ENTRIES \
   LROT_TABENTRY( string, strlib ) \
   LROT_TABENTRY( table, tab_funcs ) \
@@ -82,12 +85,14 @@ LROT_END(rotables_meta, NULL, LROT_MASK_INDEX)
 LROT_BEGIN(rotables, LROT_TABLEREF(rotables_meta), 0)
   LROT_TABENTRY( _G, base_func)
   LROT_ROM_ENTRIES
+  LROT_TABENTRY( "pixbuf.buf", pixbuf_map )
 LROT_END(rotables, LROT_TABLEREF(rotables_meta), 0)
 
 LROT_BEGIN(lua_libs, NULL, 0)
   LROT_LIB_ENTRIES
   LROT_FUNCENTRY( io, luaopen_io )
   LROT_FUNCENTRY( os, luaopen_os )
+  LROT_FUNCENTRY( pixbuf, luaopen_pixbuf )
 LROT_END(lua_libs, NULL, 0)
 
 #else /* LUA_USE_ESP */

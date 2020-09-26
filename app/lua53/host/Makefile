@@ -44,6 +44,8 @@ LUASRC  := lapi.c      lauxlib.c   lbaselib.c  lcode.c     lcorolib.c  lctype.c 
            lzio.c
 UZSRC   := uzlib_deflate.c crc32.c
 
+NMCU_MOD_SRC := pixbuf.c
+
 TEST ?=
 ifeq ("$(TEST)","1")
    DEFINES  += -DLUA_ENABLE_TEST
@@ -53,8 +55,8 @@ endif  # $(TEST)==1
 #
 # This relies on the files being unique on the vpath
 #
-SRC      := $(LUACSRC) $(LUASRC) $(UZSRC)
-vpath %.c .:..:../../libc:../../uzlib
+SRC      := $(LUACSRC) $(LUASRC) $(UZSRC) $(NMCU_MOD_SRC)
+vpath %.c .:..:../../libc:../../uzlib:../../modules
 
 ODIR   := .output/$(TARGET)/$(FLAVOR)/obj
 
