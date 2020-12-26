@@ -138,14 +138,20 @@ local function fail(handler, name, func, expected, msg)
   handler('pass', name, msg)
 end
 
-local function NTest(testrunname, failoldinterface)
+local nmt = {
+  env = _G,
+  outputhandler = TERMINAL_HANDLER
+}
+nmt.__index = nmt
+
+return function(testrunname, failoldinterface)
 
   if failoldinterface then error("The interface has changed. Please see documentstion.") end
 
   local pendingtests = {}
-  local env = _G
-  local outputhandler = TERMINAL_HANDLER
   local started
+
+  local N = setmetatable({}, nmt)
 
   local function runpending()
     if pendingtests[1] ~= nil then
@@ -153,7 +159,7 @@ local function NTest(testrunname, failoldinterface)
         pendingtests[1](runpending)
       end)
     else
-      outputhandler('finish', testrunname)
+      N.outputhandler('finish', testrunname)
     end
   end
 
@@ -169,9 +175,9 @@ local function NTest(testrunname, failoldinterface)
     local testfn = function(next)
 
       local prev = {}
-      copyenv(prev, env)
+      copyenv(prev, N.env)
 
-      local handler = outputhandler
+      local handler = N.outputhandler
 
       local restore = function(err)
         if err then
@@ -181,8 +187,8 @@ local function NTest(testrunname, failoldinterface)
           end
         end
         if node then node.setonerror() end
-        copyenv(env, prev)
-        outputhandler('end', name)
+        copyenv(N.env, prev)
+        handler('end', name)
         table.remove(pendingtests, 1)
         collectgarbage()
         if next then next() end
@@ -200,6 +206,7 @@ local function NTest(testrunname, failoldinterface)
         restore()
       end
 
+      local env = N.env
       env.eq = deepeq
       env.spy = spy
       env.ok = function (cond, msg) wrap(assertok, false, cond, msg) end
@@ -225,7 +232,7 @@ local function NTest(testrunname, failoldinterface)
     end
 
     if not started then
-      outputhandler('start', testrunname)
+      N.outputhandler('start', testrunname)
       started = true
     end
 
@@ -236,25 +243,20 @@ local function NTest(testrunname, failoldinterface)
     end
   end
 
-  local function test(name, f)
+  function N.test(name, f)
     testimpl(name, f)
   end
 
-  local function testasync(name, f)
+  function N.testasync(name, f)
     testimpl(name, f, true)
-  end
-
-  local function report(f, envP)
-    outputhandler = f or outputhandler
-    env = envP or env
   end
 
   local currentCoName
 
-  local function testco(name, func)
+  function N.testco(name, func)
   --  local t = tmr.create();
     local co
-    testasync(name, function(Next)
+    N.testasync(name, function(Next)
       currentCoName = name
 
       local function getCB(cbName)
@@ -265,7 +267,7 @@ local function NTest(testrunname, failoldinterface)
                       currentCoName = nil
                       Next(err)
                     else
-                      outputhandler('fail', name, "Found stray Callback '"..cbName.."' from test '"..name.."'")
+                      N.outputhandler('fail', name, "Found stray Callback '"..cbName.."' from test '"..name.."'")
                     end
                   elseif coroutine.status(co) == "dead" then
                     currentCoName = nil
@@ -293,9 +295,5 @@ local function NTest(testrunname, failoldinterface)
     end)
   end
 
-
-  return {test = test, testasync = testasync, testco = testco, report = report}
+  return N
 end
-
-return NTest
-
